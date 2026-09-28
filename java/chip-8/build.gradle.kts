@@ -1,5 +1,6 @@
 plugins {
     id("java")
+    id("jacoco")
 }
 
 group = "dev.daniel-taylor.emulated-freedom"
@@ -18,6 +19,15 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    finalizedBy(tasks.jacocoTestReport)
+}
+
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports {
+        xml.required = true
+        html.required = true
+    }
 }
 
 tasks.jar {
