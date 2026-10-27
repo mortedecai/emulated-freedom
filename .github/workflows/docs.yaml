@@ -1,0 +1,263 @@
+name: Docs
+
+# Builds the AsciiDoc documents under docs/ (any folder holding an index.adoc)
+# to a PDF and a zipped HTML site, and uploads each as a workflow artifact.
+# Only documents that use a changed file are built; scripts/docs-affected.sh
+# decides which. See "Documentation" in README.adoc for the convention.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "scripts/build-docs.sh"
+      - "scripts/docs-affected.sh"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "scripts/build-docs.sh"
+      - "scripts/docs-affected.sh"
+      - ".github/workflows/docs.yml"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover:
+    name: Find documents
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      documents: ${{ steps.plan.outputs.documents }}
+      skipped: ${{ steps.plan.outputs.skipped }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          # All commits and trees but no file contents: enough to diff against
+          # the base commit without downloading the repository's history.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Choose documents to build
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          # Build everything on a manual run, or when there is no base commit to
+          # compare with (a new branch, or a force push that dropped it).
+          if [ "$EVENT" != "workflow_dispatch" ] && [ -n "$BASE_SHA" ] \
+            && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git diff --name-only --no-renames "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+            echo "Changed files:"
+            cat "$RUNNER_TEMP/changed.txt"
+            plan="$(scripts/docs-affected.sh --changed "$RUNNER_TEMP/changed.txt")"
+          else
+            plan="$(scripts/docs-affected.sh --all)"
+          fi
+          echo "Plan:"
+          jq -r '.[] | "\(.document): \(if .rebuild then "build" else "skip" end) (\(.reason))"' <<< "$plan"
+          echo "documents=$(jq -c 'map(select(.rebuild))' <<< "$plan")" >> "$GITHUB_OUTPUT"
+          echo "skipped=$(jq -c 'map(select(.rebuild | not) | .document)' <<< "$plan")" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.document }}
+    needs: discover
+    if: needs.discover.outputs.documents != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.documents) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The key hashes everything the document uses, so a saved build under the
+      # same key is what this build would produce. Documents with references
+      # the plan could not resolve are never cached.
+      - name: Restore a previous build
+        id: cache
+        if: matrix.cacheable
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/docs/${{ matrix.name }}
+          key: docs-${{ matrix.name }}-${{ matrix.key }}
+
+      # Java (for PlantUML) and Ruby come with the runner image.
+      - name: Install Asciidoctor
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq graphviz
+          sudo gem install --no-document \
+            asciidoctor:2.0.26 \
+            asciidoctor-pdf:2.3.27 \
+            asciidoctor-diagram:3.2.1 \
+            asciidoctor-diagram-plantuml:1.2026.2 \
+            rouge:5.1.0
+
+      - name: Build PDF and HTML
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          DOCUMENT: ${{ matrix.document }}
+        run: scripts/build-docs.sh "$DOCUMENT"
+
+      # The build must only read docs/, never rewrite them.
+      - name: Check sources are unchanged
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=all -- docs)" ]; then
+            git status --short -- docs
+            echo "::error::The docs build changed files under docs/"
+            exit 1
+          fi
+
+      - name: Save the build for reuse
+        if: matrix.cacheable && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/docs/${{ matrix.name }}
+          key: docs-${{ matrix.name }}-${{ matrix.key }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: docs-${{ matrix.name }}
+          path: |
+            build/docs/${{ matrix.name }}/*.pdf
+            build/docs/${{ matrix.name }}/*-html.zip
+          if-no-files-found: error
+
+  # Posts one comment on the pull request linking each document's artifact,
+  # and updates that same comment on every later run. Fork pull requests get a
+  # read-only token, so they are skipped; their artifacts are still on the run.
+  comment:
+    name: Link artifacts on the pull request
+    needs: [discover, build]
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      needs.build.result != 'skipped' &&
+      needs.build.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Post or update the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          SKIPPED: ${{ needs.discover.outputs.skipped }}
+        run: |
+          set -euo pipefail
+          marker='<!-- docs-workflow-artifacts -->'
+          run_url="https://github.com/$REPO/actions/runs/$RUN_ID"
+
+          artifacts="$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name | startswith("docs-")) | "| `\(.name)` | [Download](https://github.com/'"$REPO"'/actions/runs/'"$RUN_ID"'/artifacts/\(.id)) | \(.expires_at[0:10]) |"')"
+
+          {
+            echo "$marker"
+            echo "### Built documents"
+            echo
+            if [ "$BUILD_RESULT" = "success" ]; then
+              echo "The docs built for \`${HEAD_SHA:0:7}\`. Each download is a zip holding the PDF and the zipped HTML."
+            else
+              echo "At least one document failed to build for \`${HEAD_SHA:0:7}\`. See the [workflow run]($run_url) for the errors."
+            fi
+            echo
+            if [ -n "$artifacts" ]; then
+              echo "| Document | Link | Available until |"
+              echo "|---|---|---|"
+              echo "$artifacts"
+            else
+              echo "No document artifacts were uploaded."
+            fi
+            not_rebuilt="$(jq -r '.[] | "* `\(.)`"' <<< "$SKIPPED")"
+            if [ -n "$not_rebuilt" ]; then
+              echo
+              echo "Not rebuilt, because nothing they use changed:"
+              echo
+              echo "$not_rebuilt"
+            fi
+            echo
+            echo "[Workflow run]($run_url)"
+          } > comment.md
+
+          comment_id="$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("'"$marker"'"))) | .id' | head -n 1)"
+
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$comment_id" -F body=@comment.md > /dev/null
+          else
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@comment.md > /dev/null
+          fi
+
+  # Builds the whole documentation site and publishes it to the gh-pages
+  # branch. Runs on a published release (the site reflects the released
+  # version) and on a manual run (to publish the coming-soon page before the
+  # first release). A release requires every document to build; a manual run
+  # skips any that fail, so work in progress does not block the landing page.
+  deploy:
+    name: Publish site to GitHub Pages
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Keep the token so the gh-pages push can authenticate, and fetch
+          # tags so a manual run can fall back to the latest one for a version.
+          fetch-depth: 0
+
+      # Java (for PlantUML) and Ruby come with the runner image.
+      - name: Install Asciidoctor
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq graphviz
+          sudo gem install --no-document \
+            asciidoctor:2.0.26 \
+            asciidoctor-diagram:3.2.1 \
+            asciidoctor-diagram-plantuml:1.2026.2 \
+            rouge:5.1.0
+
+      - name: Build the site
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          IS_RELEASE: ${{ github.event_name == 'release' }}
+        run: |
+          set -euo pipefail
+          version="$RELEASE_TAG"
+          if [ -z "$version" ]; then
+            version="$(git describe --tags --abbrev=0 2>/dev/null || echo unreleased)"
+          fi
+          if [ "$IS_RELEASE" = "true" ]; then strict=1; else strict=0; fi
+          SITE_DIR="$PWD/build/pages" VERSION="$version" STRICT="$strict" \
+            scripts/build-pages.sh
+
+      - name: Publish to gh-pages
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: scripts/publish-pages.sh build/pages
