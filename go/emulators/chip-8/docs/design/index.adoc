@@ -1,0 +1,13 @@
+= index.adoc
+:toc:
+:icons: font
+
+Introductory paragraph describing what this article covers.
+
+== First section
+
+Content goes here.
+
+== Second section
+
+Content goes here.
